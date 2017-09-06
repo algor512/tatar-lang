@@ -1,0 +1,8 @@
+bidict==0.13.1
+click==6.7
+numpy==1.13.1
+pandas==0.20.3
+pomegranate==0.7.7
+toolz==0.8.2
+tqdm==4.15.0
+ujson==1.35
