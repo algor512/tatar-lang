@@ -103,6 +103,7 @@ def main(all_tags, vectorized, ans_vectorized, sentences):
             chain = Chain(chain_id, sentences)
         else:
             chain.append_word(current_item)
+    chain.flush()
 
     assert ids_unambig == set(list(ids_ans) + list(ids_unsolved))
     assert ids_unambig - ids_ans - ids_unsolved == set()

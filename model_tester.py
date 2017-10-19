@@ -1,105 +1,106 @@
 #!/usr/bin/env python2.7
-import os
 import click
 import logging
-import numpy as np
 import pandas as pd
 import pomegranate as pg
 import ujson as json
-from collections import defaultdict
-from itertools import product, izip, imap, cycle, ifilter
 from tqdm import tqdm
+from itertools import product, repeat, izip
+from multiprocessing import Pool
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(asctime)s : %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger()
 
 
-def load_tests(line, texts):
-    sentence = json.loads(line)
-    if sentence["text"] not in texts:
-        return
+def get_answer(sentence, model):
     if any(len(w["v"]) > 1 and len(w["a"]) == 0 for w in sentence["words"]):
         logger.debug("Sentence %d has unresolved words, skip", sentence["id"])
         return
 
-    unambig_word_count = sum(len(w["v"]) > 1 for w in sentence["words"])
-    total_word_count = len(sentence["words"])
-
+    result = []
+    word_ids = []
     parts = []
     current_part = []
+    unambig_count = 0
     for w in sentence["words"]:
+        result.append(w["v"][0] if len(w["v"]) == 1 else w["a"][0])
+        word_ids.append(w["id"])
+
         if len(w["v"]) > 1:
-            current_part.append(w)
-        elif len(current_part) == 0 or len(current_part[-1]["v"]) > 1:
+            unambig_count += 1
             current_part.append(w)
         else:
-            parts.append(current_part)
-            current_part = [w]
-    parts.append(current_part)
+            if len(current_part) > 0:
+                parts.append(current_part)
+            current_part = []
+    if len(current_part) > 0:
+        parts.append(current_part)
 
-    assert sum(map(len, parts)) == total_word_count
+    result = pd.DataFrame(result, index=word_ids)
 
-    parts = filter(lambda p: len(p) >= 1, parts)
-
-    chains = []
+    answers = []
     for part in parts:
-        result = np.array([w["v"][0] if len(w["v"]) == 1 else w["a"][0] for w in part])
-        answers = imap(np.array, product(*[w["v"] for w in part]))
-        chains.append((result, answers))
+        word_ids = [w["id"] for w in part]
+        temp = result.copy()
 
-    return sentence["id"], total_word_count, unambig_word_count, chains
+        max_prob, max_answer = None, None
+        for answer in product(*[w["v"] for w in part]):
+            answer = pd.DataFrame(list(answer), index=word_ids)
+            temp.loc[answer.index, :] = answer
+            prob = model.log_probability(temp.values)
+            if max_prob is None or prob > max_prob:
+                max_prob = prob
+                max_answer = answer.copy()
+        answers.append(max_answer)
+
+    temp = result.copy()
+    for answer in answers:
+        temp.loc[answer.index,:] = answer
+
+    return result != temp
+
+
+def process(args):
+    (line, model) = args
+    sentence = json.loads(line)
+    errors = get_answer(sentence, model)
+    if errors is None:
+        return
+
+    results = dict()
+    results["words"] = errors.shape[0]
+    results["errors_by_tag"] = list(errors.sum(axis=0).values)
+    results["errors"] = errors.any(axis=1).sum()
+
+    sent_unambig = []
+    sent_unambig_all = 0
+    for word in sentence["words"]:
+        if len(word["v"]) > 1:
+            sent_unambig_all += 1
+            variants = pd.DataFrame(word["v"])
+            sent_unambig.append(variants.nunique() > 1)
+    if sent_unambig_all > 0:
+        results["unambig"] = sent_unambig_all
+        results["unambig_by_tag"] = list((pd.concat(sent_unambig, axis=1)).sum(axis=1).values)
+    results["id"] = sentence["id"]
+    results["text"] = sentence["text"]
+
+    return results
 
 
 @click.command()
 @click.argument("sentences", type=click.File("rt", encoding="utf8"))
 @click.argument("model", type=click.File("rt", encoding="utf8"))
-@click.option("--texts", nargs=2, default=[1, 10], type=int)
-def main(sentences, model, texts):
-    texts = set(range(texts[0], texts[1] + 1))
-
-    logger.info("Texts: %s", sorted(list(texts)))
-
+@click.argument("output", type=click.File("wt"))
+def main(sentences, model, output):
     model = pg.HiddenMarkovModel.from_json(model.read())
-    metrics = defaultdict(int)
+    pool = Pool(processes=5)
 
-    with tqdm() as pbar:
-        for l in sentences:
-            item = load_tests(l, texts)
-            if item is None:
-                continue
-            (sid, total_word_count, unambig_word_count, samples) = item
-            pbar.update(1)
-
-            errors = 0
-            for result, sample in samples:
-                max_prob, max_chain = None, None
-                result_cnt = 0
-                for chain in sample:
-                    assert chain.shape == result.shape
-                    result_cnt += int(np.all(chain == result))
-                    prob = model.log_probability(chain)
-                    if prob >= 0.:
-                        prob = -np.inf
-                    if max_prob is None or prob > max_prob:
-                        max_prob, max_chain = prob, chain
-                assert result_cnt == 1
-                errors += np.sum(np.any(max_chain != result, axis=1))
-
-            metrics["all_words"] += total_word_count
-            metrics["all_sent"] += 1
-            metrics["wrong_words"] += errors
-            metrics["wrong_sent"] += int(errors > 0)
-            metrics["unambig_words"] += unambig_word_count
-            metrics["unambig_sent"] += int(unambig_word_count > 0)
-
-    for metric_name, val in metrics.iteritems():
-        print "{}\t{}".format(metric_name, val)
-    print
-    print "Unambiguous words accuracy: ", 100. * (1 - 1. * metrics["wrong_words"] / metrics["unambig_words"])
-    print "All words accuracy: ", 100. * (1 - 1. * metrics["wrong_words"] / metrics["all_words"])
-    print "Unambiguous sentences accuracy: ", 100. * (1 - 1. * metrics["wrong_sent"] / metrics["unambig_sent"])
-    print "All sentences accuracy: ", 100. * (1 - 1. * metrics["wrong_sent"] / metrics["all_sent"])
-
+    for result in tqdm(pool.imap_unordered(process, izip(sentences, repeat(model))), total=114883):
+        if result is not None:
+            output.write(json.dumps(result))
+            output.write("\n")
+    output.close()
 
 if __name__ == "__main__":
     main()

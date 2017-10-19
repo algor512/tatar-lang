@@ -1,24 +1,24 @@
 #!/usr/bin/env python2.7
-import os
 import click
 import logging
-import pandas as pd
+import ujson as json
 import numpy as np
 import pomegranate as pg
+
+from tqdm import tqdm
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(asctime)s : %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger()
 
 
-def generate_random_dist(shape, roots=None):
+def generate_random_dist(shape, roots):
     dists = []
     if roots is not None:
         probs = np.random.rand(len(roots))
         probs = probs / np.sum(probs)
         dists.append(pg.DiscreteDistribution(dict(zip(roots, probs))))
-        shape -= 1
-    for i in range(shape):
+    for i in range(shape-1):
         probs = np.random.rand(2)
         probs = probs / np.sum(probs)
         dists.append(pg.DiscreteDistribution(dict(zip([0, 1], probs))))
@@ -26,49 +26,63 @@ def generate_random_dist(shape, roots=None):
 
 
 @click.command()
-@click.argument("tags", type=click.File("rt", encoding="utf8"))
-@click.argument("roots", type=click.File("rt", encoding="utf8"))
-@click.argument("train", type=click.Path(exists=True))
+@click.argument("sentences", type=click.File("rt", encoding="utf8"))
 @click.argument("output", type=click.File("wt", encoding="utf8"))
+@click.argument("roots_file", type=click.File("rt", encoding="utf8"))
 @click.option("--texts", nargs=2, default=[1, 10], type=int)
 @click.option("--states", default=10, type=int)
-@click.option("--no-roots", is_flag=True)
-def main(tags, roots, train, output, texts, states, no_roots):
-    logger.info("No roots: %s", no_roots)
-
+@click.option("--init", default=None, type=click.File("rt", encoding="utf8"))
+@click.option("--method", type=click.Choice(["viterbi", "baum-welch"]), default="viterbi")
+def main(sentences, output, roots_file, texts, states, init, method):
     texts = set(range(texts[0], texts[1] + 1))
-    columns = ["RootId"] + tags.read().splitlines() + ["ChainId"]
-    roots = range(len(roots.read().splitlines())) + [-1]
-
-    print len(roots), max(roots)
-    sys.exit(0)
 
     logger.info("Texts: %s", texts)
     logger.info("States: %d", states)
 
     logger.info("Load data...")
-    chains = []
-    for f in os.listdir(train):
-        textid = int(f.split(".")[0].split("_")[1])
-        if textid in texts:
-            data = pd.read_csv(os.path.join(train, f), sep="\t", names=columns)
-            for chain_id, chain in data.groupby("ChainId"):
-                if chain.shape[0] > 5:
-                    chains.append(chain.drop(["ChainId", "RootId"] if no_roots else "ChainId", axis=1))
-    concated_chains = pd.concat(chains).as_matrix()
+
+    roots = range(len(roots_file.read().splitlines())) + [-1]
+    roots_file.close()
+
+    unsolved_words = 0
+    train_dataset = []
+    for l in tqdm(sentences):
+        sentence = json.loads(l)
+
+        if sentence["text"] not in texts:
+            continue
+
+        ans = []
+        for w in sentence["words"]:
+            if len(w["v"]) == 1:
+                ans.append(w["v"][0])
+            elif len(w["a"]) == 1:
+                ans.append(w["a"][0])
+            else:
+                ans.append(None)
+                unsolved_words += 1
+        if None not in ans:
+            train_dataset.append(np.array(ans))
+    logging.info("There are %d unsolved words", unsolved_words)
+    logging.info("%d sentences have been loaded", len(train_dataset))
 
     logger.info("Initialise distributions...")
-    dists = [generate_random_dist(concated_chains.shape[1], None if no_roots else roots) for _ in range(states)]
-    trans_mat = np.ones((states, states)) / (1. * states)
-    starts = np.ones(states) / (1. * states)
-    ends = np.ones(states) / (1. * states)
+    if init is None:
+        logger.info("Use random initialization.")
+        dists = [generate_random_dist(train_dataset[0].shape[1], roots) for _ in range(states)]
+        trans_mat = np.ones((states, states)) / (1. * states)
+        starts = np.ones(states) / (1. * states)
+        ends = np.ones(states) / (1. * states)
 
-    logger.info("Model fitting...")
-    model = pg.HiddenMarkovModel.from_matrix(trans_mat, dists, starts, ends)
-    model.fit([ch.as_matrix() for ch in chains], verbose=True, n_jobs=8,
-              max_iterations=5000, stop_threshold=0.0001, pseudocount=0.1)
+        model = pg.HiddenMarkovModel.from_matrix(trans_mat, dists, starts, ends)
+    else:
+        logger.info("Load model from file %s", init.name)
+        model = pg.HiddenMarkovModel.from_json(init.read())
 
-    logger.info("Write output...")
+    logger.info("Model fitting ({}):".format(method))
+    model.fit(train_dataset, verbose=True, n_jobs=8, pseudocount=0.1, algorithm=method)
+
+    logger.info("Write outputs")
     output.write(unicode(model.to_json()))
     output.close()
 
